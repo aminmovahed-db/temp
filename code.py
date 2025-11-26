@@ -1,27 +1,49 @@
-from datetime import datetime
-
-def update_reader_option_if_newer(
-    source_details: SourceDetailsCloudFiles,
-    option_name: str,
-    new_value: str
-) -> None:
+def validate_timestamp(ts: str) -> str:
     """
-    Update a timestamp-based reader option only if new_value is newer.
-    Assumes timestamps are already validated via _validate_timestamp_for_dlt.
+    Valid formats:
+      - 2024-01-01T00:00:00Z
+      - 2024-01-01 00:00:00
+      - 2024-01-01 00:00:00 UTC+00
+    Raises ValueError on invalid input.
     """
 
-    existing_value = source_details.readerOptions.get(option_name)
+    if not ts or not isinstance(ts, str):
+        raise ValueError("Timestamp cannot be empty")
 
-    # If option does not exist, set it directly
-    if not existing_value:
-        source_details.add_reader_options({option_name: new_value})
-        return
+    ts = ts.strip()
 
-    # Parse timestamps (safe because of your validator)
-    fmt = "%Y-%m-%d %H:%M:%S.%f UTC%z"
-    existing_dt = datetime.strptime(existing_value, fmt)
-    new_dt = datetime.strptime(new_value, fmt)
+    # 1. ISO format (handles Z → +00:00)
+    try:
+        datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return ts
+    except ValueError:
+        pass
 
-    # Compare and update if needed
-    if new_dt > existing_dt:
-        source_details.add_reader_options({option_name: new_value})
+    # 2. SQL format (no timezone)
+    try:
+        datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        return ts
+    except ValueError:
+        pass
+
+    # 3. SQL + UTC offset
+    if "UTC" in ts:
+        # Normalize: UTC+00 → UTC+0000
+        ts_norm = re.sub(
+            r"UTC([+-]\d{1,2})$",
+            lambda m: f"UTC{int(m.group(1)): +03d}00".replace(" ", ""),
+            ts
+        )
+        try:
+            datetime.strptime(ts_norm, "%Y-%m-%d %H:%M:%S UTC%z")
+            return ts
+        except ValueError:
+            pass
+
+    # If nothing matched → error
+    raise ValueError(
+        f"Invalid timestamp format: '{ts}'. Allowed formats:\n"
+        "  - 2024-01-01T00:00:00Z\n"
+        "  - 2024-01-01 00:00:00\n"
+        "  - 2024-01-01 00:00:00 UTC+00"
+    )
