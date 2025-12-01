@@ -1,92 +1,62 @@
-from pyspark.sql.utils import AnalysisException
+import re
+from datetime import datetime
 
-def _get_mct_config_table(self, pipeline_id: str):
-    """Query the mct_config table to get the ignore_data and read_after_timestamp
-    values for the pipeline."""
-    if not pipeline_id:
-        self.logger.info(
-            "Pipeline ID not available, skipping mct_config lookup"
+def _validate_timestamp_for_dlt(self, timestamp_value):
+    """
+    Validate that the timestamp value is in DLT-compatible UTC format.
+
+    Accepted input format ONLY:
+      YYYY-MM-DD HH:MM:SS.ffffff UTC+H
+      YYYY-MM-DD HH:MM:SS.ffffff UTC+HH
+
+    Returned value ALWAYS normalised to:
+      YYYY-MM-DD HH:MM:SS.ffffff UTC+HHMM
+
+    Example:
+      Input:  "2024-01-01 00:00:00.000001 UTC+5"
+      Output: "2024-01-01 00:00:00.000001 UTC+0500"
+    """
+
+    if timestamp_value is None:
+        return ""
+
+    timestamp_str = str(timestamp_value).strip()
+
+    # --- Step 1: Regex validation (strict structure) ---
+    pattern = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} UTC\+\d{1,2}$"
+    if not re.match(pattern, timestamp_str):
+        error_msg = (
+            f"Invalid timestamp format: '{timestamp_str}'. Allowed format:\n"
+            "  YYYY-MM-DD HH:MM:SS.ffffff UTC+H\n"
+            "  YYYY-MM-DD HH:MM:SS.ffffff UTC+HH\n"
+            "Example:\n"
+            "  2024-01-01 00:00:00.000001 UTC+00\n"
         )
-        return ("", "")
+        self.logger.error(error_msg)
+        raise ValueError(error_msg)
 
+    # --- Step 2: Normalise timezone (UTC+H → UTC+HHMM) ---
+    # Converts:
+    #   UTC+5  → UTC+0500
+    #   UTC+11 → UTC+1100
+    #   UTC+00 → UTC+0000
+    ts_norm = re.sub(
+        r"UTC\+(\d{1,2})$",
+        lambda m: f"UTC+{int(m.group(1)):02d}00",
+        timestamp_str,
+    )
+
+    # --- Step 3: Validate datetime correctness ---
     try:
-        # OPTIONAL: you can drop this block if you rely purely on AnalysisException
-        if not self.spark.catalog.tableExists(MCT_CONFIG_TABLE):
-            self.logger.info(
-                "mct_config table '%s' does not exist, returning empty strings",
-                MCT_CONFIG_TABLE,
-            )
-            return ("", "")
-
-        escaped_pipeline_id = pipeline_id.replace("'", "''")
-        query = f"""
-            SELECT ignore_data, read_after_timestamp
-            FROM {MCT_CONFIG_TABLE}
-            WHERE pipeline_id = '{escaped_pipeline_id}'
-        """
-
-        self.logger.info(
-            "Querying mct_config table '%s' for pipeline_id '%s'",
-            MCT_CONFIG_TABLE,
-            pipeline_id,
+        datetime.strptime(ts_norm, "%Y-%m-%d %H:%M:%S.%f UTC%z")
+    except ValueError as ex:
+        error_msg = (
+            f"Invalid timestamp: '{timestamp_str}'. "
+            "Timestamp structure was correct, but datetime parsing failed. "
+            f"Error: {ex}"
         )
+        self.logger.error(error_msg)
+        raise ValueError(error_msg)
 
-        try:
-            # This is the bit you wanted to protect
-            result_df = self.spark.sql(query)
-        except AnalysisException as ae:
-            # Check Databricks error class
-            error_class = getattr(ae, "errorClass", None)
-            if error_class is None and hasattr(ae, "getErrorClass"):
-                error_class = ae.getErrorClass()
-
-            if (
-                error_class == "TABLE_OR_VIEW_NOT_FOUND"
-                or "TABLE_OR_VIEW_NOT_FOUND" in str(ae)
-            ):
-                self.logger.info(
-                    "mct_config table or view '%s' not found "
-                    "(TABLE_OR_VIEW_NOT_FOUND); returning empty strings "
-                    "for pipeline_id '%s'",
-                    MCT_CONFIG_TABLE,
-                    pipeline_id,
-                )
-                return ("", "")
-            # Different AnalysisException → re-raise so outer except handles it
-            raise
-
-        rows = result_df.collect()
-        if rows and len(rows) > 0:
-            ignore_data_value = rows[0][0]
-            read_after_timestamp_value = rows[0][1]
-
-            ignore_data_str = "" if ignore_data_value is None else str(ignore_data_value)
-            read_after_timestamp_str = self._validate_timestamp_for_dlt(
-                read_after_timestamp_value
-            )
-
-            self.logger.info(
-                "Found ignore_data='%s', read_after_timestamp='%s' for pipeline_id '%s'",
-                ignore_data_str,
-                read_after_timestamp_str,
-                pipeline_id,
-            )
-            return (ignore_data_str, read_after_timestamp_str)
-        else:
-            self.logger.info(
-                "No matching record found in mct_config table '%s' for pipeline_id '%s'; "
-                "returning empty strings",
-                MCT_CONFIG_TABLE,
-                pipeline_id,
-            )
-            return ("", "")
-
-    except Exception as e:
-        self.logger.warning(
-            "Error querying mct_config table '%s' for pipeline_id '%s': %s. "
-            "Returning empty strings.",
-            MCT_CONFIG_TABLE,
-            pipeline_id,
-            str(e),
-        )
-        return ("", "")
+    # --- Step 4: Return normalised string ---
+    return ts_norm
