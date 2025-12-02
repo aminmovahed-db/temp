@@ -6,7 +6,7 @@ This page describes the behaviour of the new **MCT configuration** that has been
 
 At a high level:
 
-* A new **`mct_config` JSON** defines **primary** and **standby** clouds and optional overrides.
+* A new **`mct_config`**** JSON** defines **primary** and **standby** clouds and optional overrides.
 * An internal boolean parameter **`ignore_data`** is derived from this configuration.
 * When `ignore_data = true`, the framework prevents any records from being ingested while still creating or updating DLT tables.
 * This enables **schema and object deployment** to proceed, while the actual data is synchronised separately via the **data_replication framework (deep clone)**.
@@ -15,20 +15,39 @@ At a high level:
 
 ## Configuration Structure
 
-The `mct_config` JSON contains:
+The MCT configuration is composed of **two layers**:
 
-* **`primary_cloud`**: The cloud that is considered the primary execution environment (e.g. `"AWS"`, `"Azure"`).
-* **`standby_cloud`**: The cloud that is considered the standby/secondary environment.
-* **`ignore_data_override` (optional, global)**: A top-level boolean flag to explicitly control whether data should be ignored for the framework.
-* **`ignore_data_override` (optional, pipeline-level)**: A pipeline-specific boolean override (e.g. on `bronze_pipeline`) that can control behaviour for that pipeline only.
+1. **Global MCT configuration (JSON)** – shared by the bronze pipeline and the DLT framework
+2. **Per-pipeline controls (Unity Catalog Delta table)** – used by the DLT framework for pipeline-level overrides
 
-> Note: The exact JSON shape may vary by implementation, but the important aspect is that there can be **pipeline-level** and **global-level** `ignore_data_override` values, plus primary/standby cloud definitions.
+### 1. Global MCT configuration (JSON)
+
+The primary MCT configuration is stored in a JSON object (for example, `mct_config.json`) and contains the **cloud role** information and an optional **global override**:
+
+* **`primary_cloud`**: The cloud considered the primary execution environment (e.g. `"AWS"`, `"Azure"`).
+* **`standby_cloud`**: The cloud considered the standby/secondary environment.
+* **`ignore_data_override` (optional, global)**: A top-level boolean flag that explicitly controls whether data should be ignored across the framework when no pipeline-level override is provided.
+
+This JSON is used by both **bronze_pipeline** and **DLT framework** to derive the internal `ignore_data` flag when a pipeline-level override is not present.
+
+### 2. Per-pipeline controls (Unity Catalog Delta table)
+
+For the DLT framework, pipeline-specific controls are stored in a Unity Catalog Delta table:
+
+* **Table:** `operations.orchestration_lakehouse.mct_config`
+* **Key:** `pipeline_id` (one row per pipeline)
+* **Columns per pipeline:**
+
+  * `ignore_data` – optional boolean flag that acts as a *pipeline-level* override for `ignore_data`.
+  * `read_after_timestamp` – optional ingestion boundary used to control where the pipeline starts reading data from.
+
+These per-pipeline values integrate into the precedence rules for `ignore_data` and also drive the effective `read_after_timestamp` used by the DLT framework.
 
 ---
 
-## Internal Parameter: `ignore_data`
+## Internal Parameter: ignore_data
 
-An internal boolean parameter called **`ignore_data`** is introduced within the framework. This parameter is not directly exposed as user configuration, but is computed from the `mct_config` as follows:
+An internal boolean parameter called ignore_data is introduced wit not directly exposed as user configuration, but is computed from the `mct_config` as follows:
 
 * **Default:** `ignore_data = false`.
 * When set to **true**, the framework:
@@ -45,12 +64,12 @@ This design supports scenarios where **table structure and metadata** must be de
 
 The value of the internal `ignore_data` parameter is determined by a clear **precedence order**:
 
-1. **Pipeline-level `ignore_data_override` (highest precedence)**
+1. **Pipeline-level ************************`ignore_data_override`************************ (highest precedence)**
 
    * If the **optional pipeline-level** `ignore_data_override` is present (either `true` or `false`), its value is used **directly**.
    * In this case, the framework **does not** consult global overrides or cloud role (primary/standby).
 
-2. **Global `ignore_data_override` (second precedence)**
+2. **Global ************************`ignore_data_override`************************ (second precedence)**
 
    * If no pipeline-level override is specified, the framework checks the **global** `ignore_data_override` value in the `mct_config` JSON (if present).
    * If it is specified (either `true` or `false`), its value is assigned to `ignore_data`.
@@ -163,6 +182,36 @@ No data ingestion; all DLT tables are created/updated empty.
 
 **Behaviour:**
 `bronze_pipeline` ingests data as normal, even though globally and by cloud role it would otherwise ignore data.
+
+---
+
+## Pipeline-Level Controls from Unity Catalog (DLT Framework)
+
+In the DLT framework, pipeline-level controls for `ignore_data` and `read_after_timestamp` are also derived from a **Unity Catalog Delta table**.
+
+* **Table location:** `operations.orchestration_lakehouse.mct_config`
+* **Key:** `pipeline_id` (one row per pipeline)
+* **Columns per pipeline:**
+
+  * `ignore_data` – optional boolean flag that provides a *pipeline-level* override for the internal `ignore_data` parameter described above.
+  * `read_after_timestamp` – optional timestamp boundary that controls where ingestion should start from.
+
+### `read_after_timestamp` format and behaviour
+
+* The `read_after_timestamp` value **must** be provided in the exact format shown below:
+
+  * Example: `2026-01-01 00:00:00.000001 UTC+00`
+  * Pattern: `YYYY-MM-DD HH:MM:SS.ffffff UTC+HH`
+* At runtime, the framework resolves an **effective** `read_after_timestamp` for each pipeline as follows:
+
+  * If a value is present in `operations.orchestration_lakehouse.mct_config` for the corresponding `pipeline_id`, it is validated for format.
+  * If there is already a `read_after_timestamp` defined in the data flow spec, the framework compares the two values.
+  * If the value in the Unity Catalog table is **newer (later)** than the existing value in the data flow spec, it **replaces** the spec value and becomes the new effective boundary.
+  * If it is older, the existing spec value is retained.
+  * If there is no value in the spec, the table value is used as-is.
+* The resulting effective `read_after_timestamp` is applied **consistently to both file-based and Delta-based pipelines**, ensuring a single control point for advancing the ingestion boundary.
+
+This design allows operators to centrally manage per-pipeline ingestion cut-over points via a single Unity Catalog table, without modifying the underlying DLT pipeline code or data flow specifications.
 
 ---
 
