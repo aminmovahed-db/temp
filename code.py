@@ -1,62 +1,57 @@
-import re
-from datetime import datetime
+import dlt
+from pyspark.sql.functions import col, expr
 
-def _validate_timestamp_for_dlt(self, timestamp_value):
-    """
-    Validate that the timestamp value is in DLT-compatible UTC format.
+# --------------------------------------------------------------------
+# Config – update this to your actual source table name
+# --------------------------------------------------------------------
+SOURCE_TABLE = "src_db.customers"   # e.g. "my_db.customer_src"
 
-    Accepted input format ONLY:
-      YYYY-MM-DD HH:MM:SS.ffffff UTC+H
-      YYYY-MM-DD HH:MM:SS.ffffff UTC+HH
-
-    Returned value ALWAYS normalised to:
-      YYYY-MM-DD HH:MM:SS.ffffff UTC+HHMM
-
-    Example:
-      Input:  "2024-01-01 00:00:00.000001 UTC+5"
-      Output: "2024-01-01 00:00:00.000001 UTC+0500"
-    """
-
-    if timestamp_value is None:
-        return ""
-
-    timestamp_str = str(timestamp_value).strip()
-
-    # --- Step 1: Regex validation (strict structure) ---
-    pattern = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} UTC\+\d{1,2}$"
-    if not re.match(pattern, timestamp_str):
-        error_msg = (
-            f"Invalid timestamp format: '{timestamp_str}'. Allowed format:\n"
-            "  YYYY-MM-DD HH:MM:SS.ffffff UTC+H\n"
-            "  YYYY-MM-DD HH:MM:SS.ffffff UTC+HH\n"
-            "Example:\n"
-            "  2024-01-01 00:00:00.000001 UTC+00\n"
-        )
-        self.logger.error(error_msg)
-        raise ValueError(error_msg)
-
-    # --- Step 2: Normalise timezone (UTC+H → UTC+HHMM) ---
-    # Converts:
-    #   UTC+5  → UTC+0500
-    #   UTC+11 → UTC+1100
-    #   UTC+00 → UTC+0000
-    ts_norm = re.sub(
-        r"UTC\+(\d{1,2})$",
-        lambda m: f"UTC+{int(m.group(1)):02d}00",
-        timestamp_str,
+# --------------------------------------------------------------------
+# 1) Read CDF from the source Delta table
+#    (assumes CDF is already enabled on SOURCE_TABLE)
+# --------------------------------------------------------------------
+@dlt.table(
+    name="customers_cdf_raw",
+    comment="Streaming CDF feed from the source customers table"
+)
+def customers_cdf_raw():
+    return (
+        spark.readStream
+            .format("delta")
+            .option("readChangeFeed", "true")
+            # pick ONE of these; startingVersion is usually easiest
+            .option("startingVersion", 0)  
+            # .option("startingTimestamp", "2024-01-01T00:00:00Z")
+            .table(SOURCE_TABLE)
     )
 
-    # --- Step 3: Validate datetime correctness ---
-    try:
-        datetime.strptime(ts_norm, "%Y-%m-%d %H:%M:%S.%f UTC%z")
-    except ValueError as ex:
-        error_msg = (
-            f"Invalid timestamp: '{timestamp_str}'. "
-            "Timestamp structure was correct, but datetime parsing failed. "
-            f"Error: {ex}"
-        )
-        self.logger.error(error_msg)
-        raise ValueError(error_msg)
+# --------------------------------------------------------------------
+# 2) Apply changes into the target DLT table
+#    - CUSTOMER_ID is the business key
+#    - LOAD_TIMESTAMP defines ordering of changes
+#    - DELETE_FLAG (or CDF delete) treated as delete
+# --------------------------------------------------------------------
+dlt.apply_changes(
+    target="customers",                 # name of the resulting DLT table
+    source="customers_cdf_raw",         # the streaming CDF table above
+    keys=["CUSTOMER_ID"],
+    sequence_by=col("LOAD_TIMESTAMP"),
 
-    # --- Step 4: Return normalised string ---
-    return ts_norm
+    # Treat either hard deletes from CDF or DELETE_FLAG=true as deletes
+    apply_as_deletes=expr(
+        "_change_type = 'delete' OR DELETE_FLAG = true"
+    ),
+
+    # Drop technical columns from the final table
+    except_column_list=[
+        "DELETE_FLAG",
+        "LOAD_TIMESTAMP",
+        "_change_type",
+        "_commit_version",
+        "_commit_timestamp",
+        "_commit_user"
+    ],
+
+    # SCD1-style table (latest state only). Change to "2" for SCD2.
+    stored_as_scd_type="1"
+)
