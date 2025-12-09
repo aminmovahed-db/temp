@@ -1,48 +1,113 @@
-# Databricks notebook source
-import dlt
-from pyspark.sql.functions import col
-spark.conf.set("spark.databricks.sql.streamingTable.cdf.applyChanges.returnPhysicalCdf", True)
+def _init_mct_config(self):
+    """Initialize Multi-Cloud Targeting (MCT) configuration and set ignore_data flag."""
+    mct_config = self.pipeline_config.get("mct_config", None)
 
-@dlt.view(
-    name="v_brz_contract",
-    comment="This is a view created from a CDF of contract"
-)
-def v_brz_contract():
-    # Your query to read from the CDF
-    return spark.readStream.format("delta") \
-        .option("readChangeFeed", "true") \
-        .table("main.nab_bronze_test_4.contract")
+    # ------------------------------------------------------------
+    # CASE 1 — No mct_config: use pipeline override only
+    # ------------------------------------------------------------
+    if not mct_config:
+        pipeline_override = (self.pipeline_details.get("ignore_data_override", "") or "").strip().lower()
 
-@dlt.view(
-    name="v_brz_loan",
-    comment="This is a view created from a CDF of contract"
-)
-def v_brz_loan():
-    # Your query to read from the CDF
-    return spark.readStream.format("delta") \
-        .option("readChangeFeed", "true") \
-        .table("main.nab_bronze_test_4.loan")
+        if pipeline_override == "true":
+            self.ignore_data = True
+        else:
+            self.ignore_data = False
 
-dlt.create_streaming_table( name = "staging_table_apnd_test")
+        self.logger.info(
+            "MCT config not found, using pipeline override only -> ignore_data = %s",
+            self.ignore_data,
+        )
+        return
 
-@dlt.append_flow(name = "flow_1", target = "staging_table_apnd_test")
-def flow_1():
-    df = spark.readStream.table("live.v_brz_contract").drop("_change_type","_commit_version","_commit_timestamp")
-    return df
+    # ------------------------------------------------------------
+    # Extract primary / standby from config
+    # ------------------------------------------------------------
+    primary = (mct_config.get("primary_cloud") or "").strip().lower()
+    standby = (mct_config.get("standby_cloud") or "").strip().lower()
 
-@dlt.append_flow(name = "flow_2", target = "staging_table_apnd_test")
-def flow_2():
-    df = spark.readStream.table("live.v_brz_loan").drop("_change_type","_commit_version","_commit_timestamp")
-    return df
+    # ------------------------------------------------------------
+    # Pipeline override (string)
+    # ------------------------------------------------------------
+    pipeline_override_raw = (self.pipeline_details.get("ignore_data_override", "") or "").strip().lower()
 
+    # ------------------------------------------------------------
+    # Cloud-specific overrides (strings)
+    # ignore_data_override_primary
+    # ignore_data_override_standby
+    # ------------------------------------------------------------
+    global_override_primary_raw = (mct_config.get("ignore_data_override_primary", "") or "").strip().lower()
+    global_override_standby_raw = (mct_config.get("ignore_data_override_standby", "") or "").strip().lower()
 
-dlt.create_streaming_table( name = "staging_table_mrg_test", table_properties = {"delta.enableChangeDataFeed": "true"} )
+    # ------------------------------------------------------------
+    # Determine derived cloud from hostname
+    # ------------------------------------------------------------
+    derived_cloud = "unknown"
+    if self.workspace_host:
+        parsed = urlparse(self.workspace_host)
+        hostname = parsed.hostname.lower() if parsed.hostname else None
 
-dlt.apply_changes(
-    target = "staging_table_mrg_test",
-    source = "staging_table_apnd_test",
-    keys = ["CONTRACT_ID"],
-    sequence_by = col("EXTRACT_DTTM"),
-    except_column_list = ["__START_AT", "__END_AT"],
-    stored_as_scd_type = 2
-)
+        if hostname:
+            if hostname == "cloud.databricks.com" or hostname.endswith(".cloud.databricks.com"):
+                derived_cloud = "aws"
+            elif hostname == "azuredatabricks.net" or hostname.endswith(".azuredatabricks.net"):
+                derived_cloud = "azure"
+
+    # ------------------------------------------------------------
+    # Log configuration details
+    # ------------------------------------------------------------
+    self.logger.info("MCT Configuration:")
+    self.logger.info("  Workspace Host: %s", self.workspace_host)
+    self.logger.info("  Derived Cloud Provider: %s", derived_cloud)
+    self.logger.info("  Primary: %s", primary)
+    self.logger.info("  Standby: %s", standby)
+    self.logger.info("  Pipeline Override: %s", pipeline_override_raw)
+    self.logger.info("  Global Override (Primary): %s", global_override_primary_raw)
+    self.logger.info("  Global Override (Standby): %s", global_override_standby_raw)
+
+    # ------------------------------------------------------------
+    # PRECEDENCE 1 — Pipeline override
+    # ------------------------------------------------------------
+    if pipeline_override_raw in ("true", "false"):
+        self.ignore_data = pipeline_override_raw == "true"
+        self.logger.info("Pipeline override applied -> ignore_data = %s", self.ignore_data)
+        return
+
+    # ------------------------------------------------------------
+    # PRECEDENCE 2 — Cloud-specific global override
+    # ------------------------------------------------------------
+
+    # Running in primary cloud
+    if derived_cloud == primary and global_override_primary_raw in ("true", "false"):
+        self.ignore_data = global_override_primary_raw == "true"
+        self.logger.info(
+            "Global primary override applied (value=%s) -> ignore_data = %s",
+            global_override_primary_raw,
+            self.ignore_data,
+        )
+        return
+
+    # Running in standby cloud
+    if derived_cloud == standby and global_override_standby_raw in ("true", "false"):
+        self.ignore_data = global_override_standby_raw == "true"
+        self.logger.info(
+            "Global standby override applied (value=%s) -> ignore_data = %s",
+            global_override_standby_raw,
+            self.ignore_data,
+        )
+        return
+
+    # ------------------------------------------------------------
+    # PRECEDENCE 3 — Derived logic (fallback)
+    # ignore = True ONLY when in standby environment
+    # ------------------------------------------------------------
+    if derived_cloud == primary:
+        self.ignore_data = False
+        self.logger.info("Derived rule: cloud == primary -> ignore_data = False")
+
+    elif derived_cloud == standby:
+        self.ignore_data = True
+        self.logger.info("Derived rule: cloud == standby -> ignore_data = True")
+
+    else:
+        self.ignore_data = False
+        self.logger.info("Derived rule: cloud does not match primary/standby -> ignore_data = False (default)")
